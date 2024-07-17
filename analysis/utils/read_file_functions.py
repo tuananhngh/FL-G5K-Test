@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 from box import Box
 import seaborn as sns
 import pickle as pkl
-
+import warnings
+import tqdm
 
 def load_server_data(strategies_dict, strategy, epoch, exp, filter=False):
     """
@@ -27,27 +28,27 @@ def load_server_data(strategies_dict, strategy, epoch, exp, filter=False):
         Dict keys: 'network', 'server_log', 'logs', 'processes', 'energy', 'monitoring' ('round_time' exists exist depend on experiment)
     """
     files = strategies_dict[strategy]['split_epoch'][epoch][exp]['server']
-    file_keys = files.keys()
     csv_files = {}
     if filter:
         exp_acc_time = strategies_dict[strategy]['split_epoch'][epoch][exp]['summary']['result_time']['acc_distributed']['time']
-    for key in file_keys:
+    for key,val in files.items():
         if key == 'network':
-            network_log = files[key]
+            network_log = val
             file_df = network_log_to_csv(network_log)
         elif key in ['server_log','logs']:
-            server_log = files[key]
+            server_log = val
             file_df = server_log_file_to_csv(server_log)
         else:
-            if ('results' not in key) and ('model' not in key):
-                file_df = pd.read_csv(files[key])
+            if key not in ['results','model']:
+            #if ('results' not in key) and ('model' not in key):
+                file_df = pd.read_csv(val)
                 file_df.columns = file_df.columns.str.lower()
                 for col in file_df.columns:
                     if 'time' in col:
-                        try:
-                            file_df[col] = pd.to_datetime(file_df[col], format='mixed')
-                        except ValueError:
-                            print(f"Error : {strategy} {epoch} {exp} {key}, can not converting {col} to datetime ")
+                        if (convert_col := pd.to_datetime(file_df[col],errors='coerce')).notna().all():
+                            file_df[col] = convert_col
+                        else:
+                            warnings.warn(f"Error: {strategy} {epoch} {exp} {key}, can not converting {col} to datetime")
         if filter:
             try:
                 file_df = file_df[file_df['timestamp'] <= exp_acc_time]
@@ -73,43 +74,45 @@ def load_client_data(strategies_dict, strategy:str, epoch:str, exp:str, host_id:
         csv_files: A dictionnary containing pandas DataFrames for processes, fittimes, network, etc. 
     """
     files = strategies_dict[strategy]['split_epoch'][epoch][exp][f"host_{host_id}"]
-    file_keys = files.keys()
     csv_files = {}
     if filter:
-        exp_acc_time = strategies_dict[strategy]['split_epoch'][epoch][exp]['summary']['result_time']['acc_distributed']['time']
-        exp_acc_round = strategies_dict[strategy]['split_epoch'][epoch][exp]['summary']['result_time']['acc_distributed']['round']
-        exp_acc = strategies_dict[strategy]['split_epoch'][epoch][exp]['summary']['result_time']['acc_distributed']['acc']
+        key_dict = strategies_dict[strategy]['split_epoch'][epoch][exp]['summary']['result_time']['acc_distributed']
+        exp_acc_time = key_dict['time']
+        exp_acc_round = key_dict['round']
+        exp_acc = key_dict['acc']
         csv_files['filter_time'] = {'exp_acc_time': exp_acc_time, 'exp_acc_round': exp_acc_round, 'acc': exp_acc}
-
-    for key in file_keys:
+    for key,val in files.items():
         if key == 'network':
-            network_log = files[key]
+            network_log = val
             file_df = network_log_to_csv(network_log)
         elif key in ['client_log','logs']:
-            client_logs = files[key]
+            client_logs = val
             file_df = client_log_file_to_pd(client_logs)
         else:
-            file_df = pd.read_csv(files[key])
+            try:
+                file_df = pd.read_csv(val)
+            except:
+                warnings.warn(f"EmptyDataError: {strategy} {epoch} {exp} host_{host_id} {key}, empty file")
+                continue
             file_df.columns = file_df.columns.str.lower()
             for col in file_df.columns:
                 if 'time' in col:
                     try:
-                        file_df[col] = pd.to_datetime(file_df[col], format="mixed")
-                    except ValueError:
-                        print(f"Error : {strategy} {epoch} {exp} host_{host_id} {key}, can not converting {col} to datetime: {file_df[col].iloc[0]}")
+                        file_df[col] = pd.to_datetime(file_df[col],format='mixed')
+                    # if (convert_col := pd.to_datetime(file_df[col],errors='coerce',format='mixed')).notna().all():
+                    #     file_df[col] = convert_col
+                    except ValueError as e:
+                        warnings.warn(f"Error {e}: {strategy} {epoch} {exp} host_{host_id} {key}, can not converting {col} to datetime")               
         if filter:
             try:
-                if 'server round' in file_df.columns:
-                    file_df = file_df[file_df['server round'] <= exp_acc_round]
-                    #print(f"Filtering {key} with server round")
-                elif 'timestamp' in file_df.columns:
-                    file_df = file_df[file_df['timestamp'] <= exp_acc_time]
-                    #print(f"Filtering {key} with timestamp {file_df['timestamp'].iloc[-1]} <= {exp_acc_time}")
-                elif 'time' in file_df.columns:
-                    file_df = file_df[file_df['time'] <= exp_acc_time]
-                    #print(f"Filtering {key} with time {file_df['time'].iloc[-1]} <= {exp_acc_time}")
+                cols = ['server_round','timestamp','time']
+                vals = [exp_acc_round,exp_acc_time,exp_acc_time]
+                for col,val in zip(cols,vals):
+                    if col in file_df.columns:
+                        #print(f"Filtering {key} with {col} <= {val}")
+                        file_df = file_df[file_df[col] <= val]
             except KeyError as e:
-                print(f"KeyError: {strategy} {epoch} {exp} {host_id} {key} {e}")    
+                warnings.warn(f"KeyError: {strategy} {epoch} {exp} {host_id} {key} {e}")
         csv_files[key] = file_df
     return csv_files
 
@@ -181,10 +184,7 @@ def client_log_file_to_pd(path_to_log):
                     print(f"Error: {timestamp} Line: {line}")
                 data.append([timestamp, client_id, status, round, loss, accuracy])
     df = pd.DataFrame(data, columns=['timestamp', 'client_id', 'status', 'round', 'loss', 'accuracy'])
-    #df.iloc[-1]["status"] = "Disconnect and shut down"
     df["status"] = df["status"].apply(lambda x: "END EVALUATE" if pd.isnull(x) else x)
-    #df["shifted_timestamp"] = df["timestamp"].shift(-1)
-    #df["duration"] = (df["shifted_timestamp"] - df["timestamp"]).dt.total_seconds()
     return df
 
 

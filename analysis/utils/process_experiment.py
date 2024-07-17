@@ -7,10 +7,14 @@ import yaml # pip install PyYAML
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+import warnings
+import tqdm
 from pathlib import Path
 from omegaconf import OmegaConf
 from datetime import datetime
 from box import Box
+from collections import defaultdict
+from functools import partial
 from .read_file_functions import (
     server_log_file_to_csv, 
     load_client_data, 
@@ -64,9 +68,7 @@ class ProcessResults:
                 "timestamps.start_experiment_before_sleep"
                 ],
             date_format='%Y-%m-%d_%H-%M-%S_%f')
-        #print(f"Read Summary {summary.shape}")
         summary = self._match_folder_csv(summary, strategy_path)
-        #print(f"Summary shape before matching condition : {summary.shape}")
         # Filter by parameters
         summary["result_folder"] = summary["result_folder"].apply(lambda x: x.replace("/root",  self.usr_homedir))
         if self.condition is not None: 
@@ -108,6 +110,10 @@ class ProcessResults:
         return place_holder, summary_df
     
     def _create_epochs_dict(self, by_epochs):
+        """
+        Args:
+        - by_epochs: Box from _filter_epochs[0]
+        """
         cols_to_keep_summary = ["result_folder",
                                 "server", 
                                 "timestamps.start_experiment_before_sleep",
@@ -116,47 +122,45 @@ class ProcessResults:
                                 "timestamps.end_experiment_after_sleep",
                                 "client.local_epochs"]
         epochs_dict = {}
-        for epoch in by_epochs.keys():
-            byhost = {}
-            for i, path in enumerate(by_epochs.__getattr__(epoch).path):
-                byhost.setdefault(f'exp_{i}', {})
-                params = by_epochs.__getattr__(epoch).summary[by_epochs.__getattr__(epoch).summary["result_folder"] == path]
+        for key,val in by_epochs.items():
+            nested_dict = partial(defaultdict, dict)
+            byhost = defaultdict(nested_dict)
+            #byhost = {}
+            for i, path in enumerate(val.path):
+                #byhost.setdefault(f'exp_{i}', {})
+                params = val.summary[val.summary["result_folder"] == path]
                 params = params[cols_to_keep_summary]
                 byhost[f'exp_{i}']['summary'] = params.to_dict(orient='records')[0]        
                 subfolder = [(subfold.split('/')[-1], os.path.join(path, f'{subfold}')) for subfold in os.listdir(path)]
-                for k in range(len(subfolder)):
-                    host_name = subfolder[k][0]
-                    host_name = host_name.replace('client_host','host')
-                    host_path = subfolder[k][1]
+                for k,folder in enumerate(subfolder):
+                    host_name = folder[0].replace('client_host','host')
+                    host_path = folder[1]
                     if os.path.isdir(host_path):
                         files = os.listdir(host_path)
-                        for e,file in enumerate(files):
-                            if file == 'client.log' :
-                                files[e] = 'client_log'
-                            elif file == 'server.log':
-                                files[e] = 'server_log'
-                            elif file == 'client_pids.csv':
-                                files[e] = 'client_pid'
-                            else:
-                                #print(re.split('[.]', file)[0])
-                                files[e] = re.split('[.]', file)[0]
+                        file_mapping = {
+                            'client.log':'client_log',
+                            'server.log':'server_log',
+                            'client_pids.csv':'client_pid'
+                        }
+                        files = [file_mapping.get(file, re.split(r'\.', file)[0]) for file in files]
                         result_files = [(name, os.path.join(host_path,file)) for name,file in zip(files,os.listdir(host_path))]
+                        #exp_key = f'exp_{i}'
                         for file_name, file_path in result_files:
-                            #print(f'exp_{i} {host_name} {file_name} {file_path}')
-                            byhost[f'exp_{i}'].setdefault(host_name, {}).setdefault(file_name,file_path)
-                        #byhost[f'exp_{i}'][client_name] = subfolder[k][1]
-            #print(f'by host {byhost}')
-            epochs_dict[epoch] = byhost
+                            #byhost[f'exp_{i}'].setdefault(host_name, {}).setdefault(file_name,file_path)
+                            byhost[f'exp_{i}'][host_name][file_name] = file_path
+            epochs_dict[key] = byhost
         return epochs_dict
     
     def _create_json_file(self)->Dict[str, Dict[str, Dict[str, Dict]]]:
-        strategy_dict = {}
+        strategy_dict = defaultdict(dict)
+        #strategy_dict = {}
         for strategy in self.strategies:
             print(f"Reading summary file for {strategy}")
             path = os.path.join(self.output_dir, strategy, self.split)
             summary = self.read_summaryfile(path)
             by_epochs, summary_epochs = self._filter_epochs(summary)
-            strategy_dict.setdefault(strategy, {}).setdefault('exp_summary', summary_epochs.to_dict(orient='records'))
+            #strategy_dict.setdefault(strategy, {}).setdefault('exp_summary', summary_epochs.to_dict(orient='records'))
+            strategy_dict[strategy]['exp_summary'] = summary_epochs.to_dict(orient='records')
             strategy_dict[strategy]['split_epoch'] = self._create_epochs_dict(by_epochs)
         return strategy_dict
     
@@ -171,19 +175,27 @@ class ProcessResults:
         log_path = self.strategies_dict[strategy]['split_epoch'][epoch][exp]['server']['logs']
         server_accuracy = read_server(result_path)
         metrics = ['acc_centralized', 'acc_distributed']
+        server_log = server_log_file_to_csv(log_path)
         results = Box()
         for m in metrics:
-            round_threshold = server_accuracy[server_accuracy[m] >= self.threshold]['server_round'].iloc[0]
-            acc_threshold = server_accuracy[server_accuracy[m] >= self.threshold][m].iloc[0]
-            loss_threshold = server_accuracy[server_accuracy[m] >= self.threshold]['losses_distributed'].iloc[0]
-            results[m] = {'round': round_threshold, 'acc': acc_threshold}
-        round_acc_cen = results.acc_centralized.round
-        round_acc_dis = results.acc_distributed.round
-        server_log = server_log_file_to_csv(log_path)
-        time_cen = server_log[server_log['round_number'] == round_acc_cen]['timestamp'].iloc[-1]
-        time_dis = server_log[server_log['round_number'] == round_acc_dis]['timestamp'].iloc[-1]
-        results.acc_centralized['time'] = time_cen
-        results.acc_distributed['time'] = time_dis
+            try :
+                round_threshold = server_accuracy[server_accuracy[m] >= self.threshold]['server_round'].iloc[0]
+                acc_threshold = server_accuracy[server_accuracy[m] >= self.threshold][m].iloc[0]
+                loss_threshold = server_accuracy[server_accuracy[m] >= self.threshold]['losses_distributed'].iloc[0]
+                #results[m] = {'round': round_threshold, 'acc': acc_threshold}
+                time_acc = server_log[server_log['round_number'] == round_threshold]['timestamp'].iloc[-1]
+                results[m] = {'round': round_threshold, 'acc': acc_threshold, 'time': time_acc}
+                #results[m]['time'] = time_acc
+            except IndexError as e:
+                #print(f"Error : {m} doesn't have a round above threshold")
+                warnings.warn(f"{m} doesn't have a round above threshold : {e}")
+                results[m] = {'round': None, 'acc': None, 'time': None}
+            # if results[m]['round'] is not None:
+            #     round_acc = results[m]['round']
+            #     time_acc = server_log[server_log['round_number'] == round_acc]['timestamp'].iloc[-1]
+            #     results[m]['time'] = time_acc
+            # else:
+            #     results[m]['time'] = None
         self.strategies_dict[strategy]['split_epoch'][epoch][exp]['summary']['result_time'] = results.to_dict()
         
 
@@ -250,7 +262,7 @@ class EnergyResults(ProcessResults):
         exp_files = self.strategies_dict[strategy]['split_epoch'][epoch][exp]
         hosts = sorted([key for key in exp_files.keys() if 'host' in key])
         hostmetainfo = []
-        for host in hosts:
+        for hid, host in enumerate(hosts):
             host_files = self.strategies_dict[strategy]['split_epoch'][epoch][exp][host]
             file_in_host  = [name for name in host_files.keys()]
             client_list = [name.split("_")[-1].split('.')[0] for name in file_in_host if "evalresult" in name]
@@ -270,25 +282,34 @@ class EnergyResults(ProcessResults):
         """
         exp_path = self.get_experiment_summary(strategy, epoch, exp)['result_folder']
         strategy_summary = self.strategies_dict[strategy]['exp_summary']
-        exp_summary = [exp for exp in strategy_summary if exp['result_folder'] == exp_path][0]
-        has_estats = any('estats' in col for col in exp_summary.keys())
-        if not has_estats:
+        #exp_summary = [exp for exp in strategy_summary if exp['result_folder'] == exp_path][0]
+        exp_summary = next((exp for exp in strategy_summary if exp['result_folder'] == exp_path), None)
+        
+        if not exp_summary:
+            print(f"Strategy {strategy}, Epoch {epoch}, Exp {exp} doesn't have a summary file")
+            return []
+        
+        #has_estats = any('estats' in col for col in exp_summary.keys())
+        #has_estats = 'estats' in exp_summary 
+        if not 'estats' in exp_summary:
             print('No estats in summary file'.upper())
             hostmetainfo = self._get_selectedclient_in_host(strategy, epoch, exp)
             return hostmetainfo
-        else:
-            hostmetainfo = []
-            hosts = [col for col in exp_summary.keys() if "estats" in col]
-            print(f"Hosts in summary file : {hosts}")
-            for host in hosts:
-                client_list = exp_summary[host]
-                try:
-                    client_list = re.sub(r'\[|\]', '', client_list).split()
-                    client_list = [int(i) for i in client_list]
-                    hostmetainfo.append((host, client_list))
-                except TypeError as err:
-                    print(f"Host {host} doesn't have any clients: {self.exp_info[host]}, triggered {err}")
-            return hostmetainfo
+        #else:
+        hostmetainfo = []
+        hosts = [col for col in exp_summary if "estats" in col]
+        print(f"Hosts in summary file : {hosts}")
+        for host in hosts:
+            client_list = exp_summary[host]
+            try:
+                client_list = list[map(int, re.sub(r'\[|\]', '', client_list).split())]
+                # client_list = re.sub(r'\[|\]', '', client_list).split()
+                # client_list = [int(i) for i in client_list]
+                hostmetainfo.append((host, client_list))
+            except TypeError as err:
+                warnings.warn(f"Host {host} doesn't have any clients: {client_list}, triggered {err}")
+                #print(f"Host {host} doesn't have any clients: {self.exp_info[host]}, triggered {err}")
+        return hostmetainfo
     
     def _match_host_estats(self, strategy, epoch, exp) -> Dict[str, str]:
         estats = [x for x,_ in self._get_clients_in_host(strategy, epoch, exp)]
@@ -331,11 +352,11 @@ class EnergyResults(ProcessResults):
         Returns:
             SimpleNamespace: A namespace object containing the hostname, energy data, and client metadata.
         """
-        if self.threshold is not None:
+        if self.threshold: #is not None:
             host_files = load_client_data(self.strategies_dict, strategy, epoch, exp, hid, filter=True)
         else:
             host_files = load_client_data(self.strategies_dict, strategy, epoch, exp, hid, filter=False)
-        files_name = [name for name in host_files.keys()]
+        files_name = [name for name in host_files]
         #print(f"Files in host {hid} : {sorted(files_name)}")
         hostmetadata = self._get_selectedclient_in_host(strategy, epoch, exp)
         hostname = hostmetadata[hid][0]
@@ -363,14 +384,15 @@ class EnergyResults(ProcessResults):
         clients = []
         hostmetadata = self._get_selectedclient_in_host(strategy, epoch, exp)
         #print(f"Host metadata : {hostmetadata}")
-        for hid, _ in zip(range(len(hostmetadata)), hostmetadata):
+        #for hid, _ in zip(range(len(hostmetadata)), hostmetadata):
+        for hid, _ in enumerate(hostmetadata):
             try :
                 hostinfo = self._read_client_host(strategy, epoch, exp, hid)
                 for k in hostinfo.clients.keys():
                     clients.append(hostinfo.clients[k])
             except Exception as e:
                 result_folder = self.match_file_in_dict(strategy, epoch, exp)['summary']['result_folder'].split('/')[-1]
-                print(f"Error : Strategy {strategy}, Folder {result_folder}, Host {hid} doesn't have : {e}".upper())              
+                warnings.warn(f"Error: Strategy {strategy}, Folder {result_folder}, Host {hid} doesn't have : {e}".upper())            
         return clients
     
     def _get_all_host_energy(self, strategy:str, epoch:str, exp:str) -> Tuple[List[str], List[pd.DataFrame]]:
@@ -384,9 +406,11 @@ class EnergyResults(ProcessResults):
         """
         hosts = self._get_clients_in_host(strategy, epoch, exp)
         hostname, energy = [], []
-        for hid in range(len(hosts)):
+        #for hid in range(len(hosts)):
+        for hid, _ in enumerate(hosts):
             hostinfo = self._read_client_host(strategy, epoch, exp, hid)
-            if hostinfo is None:
+            #if hostinfo is None:
+            if not hostinfo:
                 continue
             try:
                 #print(f"Host {hostinfo.hostname}".upper())

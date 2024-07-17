@@ -262,7 +262,7 @@ def compute_round_stats(training_results):
 def concat_client_training_perf(result_summary:EnergyResults, strategy, epoch, exp)->pd.DataFrame:
     training_results = pd.DataFrame()
     hostmetadata = result_summary.get_clients_in_host(strategy, epoch, exp)
-    for hid in range(len(hostmetadata)):
+    for hid, hostmeta in enumerate(hostmetadata):
         hostdatafiles = result_summary.get_clients_host_data(strategy, epoch, exp, hid)
         try:
             hostname = hostdatafiles.hostname
